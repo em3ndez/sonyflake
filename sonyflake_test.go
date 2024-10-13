@@ -1,10 +1,15 @@
 package sonyflake
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/sony/sonyflake/mock"
+	"github.com/sony/sonyflake/types"
 )
 
 var sf *Sonyflake
@@ -23,7 +28,7 @@ func init() {
 
 	startTime = toSonyflakeTime(st.StartTime)
 
-	ip, _ := lower16BitPrivateIP()
+	ip, _ := lower16BitPrivateIP(defaultInterfaceAddrs)
 	machineID = uint64(ip)
 }
 
@@ -35,35 +40,83 @@ func nextID(t *testing.T) uint64 {
 	return id
 }
 
-func TestSonyflakeOnce(t *testing.T) {
-	sleepTime := uint64(50)
-	time.Sleep(time.Duration(sleepTime) * 10 * time.Millisecond)
+func TestNew(t *testing.T) {
+	genError := fmt.Errorf("an error occurred while generating ID")
 
-	id := nextID(t)
-	parts := Decompose(id)
-
-	actualMSB := parts["msb"]
-	if actualMSB != 0 {
-		t.Errorf("unexpected msb: %d", actualMSB)
+	tests := []struct {
+		name     string
+		settings Settings
+		err      error
+	}{
+		{
+			name: "failure: time ahead",
+			settings: Settings{
+				StartTime: time.Now().Add(time.Minute),
+			},
+			err: ErrStartTimeAhead,
+		},
+		{
+			name: "failure: machine ID",
+			settings: Settings{
+				MachineID: func() (uint16, error) {
+					return 0, genError
+				},
+			},
+			err: genError,
+		},
+		{
+			name: "failure: invalid machine ID",
+			settings: Settings{
+				CheckMachineID: func(uint16) bool {
+					return false
+				},
+			},
+			err: ErrInvalidMachineID,
+		},
+		{
+			name:     "success",
+			settings: Settings{},
+		},
 	}
 
-	actualTime := parts["time"]
-	if actualTime < sleepTime || actualTime > sleepTime+1 {
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sonyflake, err := New(test.settings)
+
+			if !errors.Is(err, test.err) {
+				t.Fatalf("unexpected value, want %#v, got %#v", test.err, err)
+			}
+
+			if sonyflake == nil && err == nil {
+				t.Fatal("unexpected value, sonyflake should not be nil")
+			}
+		})
+	}
+}
+
+func TestSonyflakeOnce(t *testing.T) {
+	sleepTime := time.Duration(50 * sonyflakeTimeUnit)
+	time.Sleep(sleepTime)
+
+	id := nextID(t)
+
+	actualTime := ElapsedTime(id)
+	if actualTime < sleepTime || actualTime > sleepTime+sonyflakeTimeUnit {
 		t.Errorf("unexpected time: %d", actualTime)
 	}
 
-	actualSequence := parts["sequence"]
+	actualSequence := SequenceNumber(id)
 	if actualSequence != 0 {
 		t.Errorf("unexpected sequence: %d", actualSequence)
 	}
 
-	actualMachineID := parts["machine-id"]
+	actualMachineID := MachineID(id)
 	if actualMachineID != machineID {
 		t.Errorf("unexpected machine id: %d", actualMachineID)
 	}
 
 	fmt.Println("sonyflake id:", id)
-	fmt.Println("decompose:", parts)
+	fmt.Println("decompose:", Decompose(id))
 }
 
 func currentTime() int64 {
@@ -82,8 +135,11 @@ func TestSonyflakeFor10Sec(t *testing.T) {
 		parts := Decompose(id)
 		numID++
 
-		if id <= lastID {
+		if id == lastID {
 			t.Fatal("duplicated id")
+		}
+		if id < lastID {
+			t.Fatal("must increase with time")
 		}
 		lastID = id
 
@@ -148,30 +204,6 @@ func TestSonyflakeInParallel(t *testing.T) {
 	fmt.Println("number of id:", len(set))
 }
 
-func TestNilSonyflake(t *testing.T) {
-	var startInFuture Settings
-	startInFuture.StartTime = time.Now().Add(time.Duration(1) * time.Minute)
-	if NewSonyflake(startInFuture) != nil {
-		t.Errorf("sonyflake starting in the future")
-	}
-
-	var noMachineID Settings
-	noMachineID.MachineID = func() (uint16, error) {
-		return 0, fmt.Errorf("no machine id")
-	}
-	if NewSonyflake(noMachineID) != nil {
-		t.Errorf("sonyflake with no machine id")
-	}
-
-	var invalidMachineID Settings
-	invalidMachineID.CheckMachineID = func(uint16) bool {
-		return false
-	}
-	if NewSonyflake(invalidMachineID) != nil {
-		t.Errorf("sonyflake with invalid machine id")
-	}
-}
-
 func pseudoSleep(period time.Duration) {
 	sf.startTime -= int64(period) / sonyflakeTimeUnit
 }
@@ -185,5 +217,98 @@ func TestNextIDError(t *testing.T) {
 	_, err := sf.NextID()
 	if err == nil {
 		t.Errorf("time is not over")
+	}
+}
+
+func TestPrivateIPv4(t *testing.T) {
+	testCases := []struct {
+		description    string
+		expected       net.IP
+		interfaceAddrs types.InterfaceAddrs
+		error          string
+	}{
+		{
+			description:    "InterfaceAddrs returns an error",
+			expected:       nil,
+			interfaceAddrs: mock.NewFailingInterfaceAddrs(),
+			error:          "test error",
+		},
+		{
+			description:    "InterfaceAddrs returns an empty or nil list",
+			expected:       nil,
+			interfaceAddrs: mock.NewNilInterfaceAddrs(),
+			error:          "no private ip address",
+		},
+		{
+			description:    "InterfaceAddrs returns one or more IPs",
+			expected:       net.IP{192, 168, 0, 1},
+			interfaceAddrs: mock.NewSuccessfulInterfaceAddrs(),
+			error:          "",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			actual, err := privateIPv4(tc.interfaceAddrs)
+
+			if (err != nil) && (tc.error == "") {
+				t.Errorf("expected no error, but got: %s", err)
+				return
+			} else if (err != nil) && (tc.error != "") {
+				return
+			}
+
+			if net.IP.Equal(actual, tc.expected) {
+				return
+			} else {
+				t.Errorf("error: expected: %s, but got: %s", tc.expected, actual)
+			}
+		})
+	}
+}
+
+func TestLower16BitPrivateIP(t *testing.T) {
+	testCases := []struct {
+		description    string
+		expected       uint16
+		interfaceAddrs types.InterfaceAddrs
+		error          string
+	}{
+		{
+			description:    "InterfaceAddrs returns an empty or nil list",
+			expected:       0,
+			interfaceAddrs: mock.NewNilInterfaceAddrs(),
+			error:          "no private ip address",
+		},
+		{
+			description:    "InterfaceAddrs returns one or more IPs",
+			expected:       1,
+			interfaceAddrs: mock.NewSuccessfulInterfaceAddrs(),
+			error:          "",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			actual, err := lower16BitPrivateIP(tc.interfaceAddrs)
+
+			if (err != nil) && (tc.error == "") {
+				t.Errorf("expected no error, but got: %s", err)
+				return
+			} else if (err != nil) && (tc.error != "") {
+				return
+			}
+
+			if actual == tc.expected {
+				return
+			} else {
+				t.Errorf("error: expected: %v, but got: %v", tc.expected, actual)
+			}
+		})
+	}
+}
+
+func TestSonyflakeTimeUnit(t *testing.T) {
+	if time.Duration(sonyflakeTimeUnit) != 10*time.Millisecond {
+		t.Errorf("unexpected time unit")
 	}
 }

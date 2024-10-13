@@ -2,8 +2,6 @@ Sonyflake
 =========
 
 [![GoDoc](https://godoc.org/github.com/sony/sonyflake?status.svg)](http://godoc.org/github.com/sony/sonyflake)
-[![Build Status](https://travis-ci.org/sony/sonyflake.svg?branch=master)](https://travis-ci.org/sony/sonyflake)
-[![Coverage Status](https://coveralls.io/repos/sony/sonyflake/badge.svg?branch=master&service=github)](https://coveralls.io/github/sony/sonyflake?branch=master)
 [![Go Report Card](https://goreportcard.com/badge/github.com/sony/sonyflake)](https://goreportcard.com/report/github.com/sony/sonyflake)
 
 Sonyflake is a distributed unique ID generator inspired by [Twitter's Snowflake](https://blog.twitter.com/2010/announcing-snowflake).  
@@ -35,10 +33,10 @@ go get github.com/sony/sonyflake
 Usage
 -----
 
-The function NewSonyflake creates a new Sonyflake instance.
+The function New creates a new Sonyflake instance.
 
 ```go
-func NewSonyflake(st Settings) *Sonyflake
+func New(st Settings) (*Sonyflake, error)
 ```
 
 You can configure Sonyflake by the struct Settings:
@@ -72,6 +70,10 @@ func (sf *Sonyflake) NextID() (uint64, error)
 
 NextID can continue to generate IDs for about 174 years from StartTime.
 But after the Sonyflake time is over the limit, NextID returns an error.
+
+> **Note:**
+> Sonyflake currently does not use the most significant bit of IDs,
+> so you can convert Sonyflake IDs from `uint64` to `int64` safely.
 
 AWS VPC and Docker
 ------------------
